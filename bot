@@ -1,0 +1,630 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import asyncio
+import json
+import os
+from datetime import datetime, timedelta
+
+TOKEN = "MTMxMjEwODQ0NDQ3NTcyMzg4Ng.Gaopa6.1sJtZqFlP33hhqQLUAAfC5ez6_sdUenU50BmnY"
+GUILD_ID = 676168771068493835
+ADMIN_ROLE_ID = 1270289552237662208
+PREMIUM_ROLE_ID = 1312082975764250624
+NOTIFICATION_CHANNEL_ID = 1312168783980265472
+LOGS_CHANNEL_ID = 1314045156835463199
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='/', intents=intents)
+
+account_types = {}
+cooldowns = {}
+premium_keys = {}
+user_premium_expiry = {}
+blacklisted_users = []
+premium_roles = {PREMIUM_ROLE_ID: 300}  # 5 minutes cooldown for premium
+
+DATA_FILE = "stock_data.json"
+
+async def log_action(message: str):
+    channel = bot.get_channel(LOGS_CHANNEL_ID)
+    if channel:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        embed = discord.Embed(
+            description=f"```\n{timestamp} | {message}\n```",
+            color=discord.Color.purple()
+        )
+        await channel.send(embed=embed)
+
+def load_data():
+    global account_types, premium_keys, user_premium_expiry, blacklisted_users, premium_roles
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+            account_types = data.get("account_types", {})
+            premium_keys = data.get("premium_keys", {})
+            user_premium_expiry = data.get("user_premium_expiry", {})
+            blacklisted_users = data.get("blacklisted_users", [])
+            premium_roles = data.get("premium_roles", {PREMIUM_ROLE_ID: 300})
+
+def save_data():
+    with open(DATA_FILE, 'w') as f:
+        json.dump({
+            "account_types": account_types,
+            "premium_keys": premium_keys,
+            "user_premium_expiry": user_premium_expiry,
+            "blacklisted_users": blacklisted_users,
+            "premium_roles": premium_roles
+        }, f)
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+    load_data()
+    print(f'Logged in as {bot.user}')
+    await log_action("Bot started successfully")
+
+async def adjust_cooldown_for_premium(user_id: int):
+    if user_id in cooldowns:
+        for acctype in cooldowns[user_id]:
+            current_cooldown = cooldowns[user_id][acctype] - datetime.now().timestamp()
+            if current_cooldown > 300:  # If more than 5 minutes remaining
+                cooldowns[user_id][acctype] = datetime.now().timestamp() + 300  # Set to 5 minutes
+        await log_action(f"Adjusted cooldown for user {user_id} to premium rate")
+
+@bot.tree.command(name="generate", description="Generate an account", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(acctype="The type of account to generate")
+async def generate(interaction: discord.Interaction, acctype: str):
+    user_id = interaction.user.id
+    if user_id in blacklisted_users:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="❌ You are blacklisted from using this bot.",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        await log_action(f"Blacklisted user {user_id} attempted to generate {acctype}")
+        return
+
+    is_premium = any(role.id == PREMIUM_ROLE_ID for role in interaction.user.roles)
+    num_accounts = 2 if is_premium else 1
+    cooldown_time = 300 if is_premium else 600  # 5 minutes for premium, 10 minutes for free
+
+    if acctype not in account_types:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="❌ Account type not found.",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        await log_action(f"User {user_id} attempted to generate invalid account type: {acctype}")
+        return
+
+    if user_id in cooldowns and acctype in cooldowns[user_id]:
+        remaining_time = cooldowns[user_id][acctype] - datetime.now().timestamp()
+        hours, remainder = divmod(int(remaining_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        time_str = ""
+        if hours > 0:
+            time_str += f"{hours}h "
+        if minutes > 0:
+            time_str += f"{minutes}m "
+        time_str += f"{seconds}s"
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=f"⏰ You are on cooldown. Please wait {time_str}",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        return
+
+    accounts = account_types[acctype][:num_accounts]
+    if not accounts:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="❌ Out of stock.",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        await log_action(f"Out of stock for {acctype} when user {user_id} attempted to generate")
+        return
+
+    account_types[acctype] = account_types[acctype][num_accounts:]
+    save_data()
+
+    for account in accounts:
+        embed = discord.Embed(
+            title="🎮 Rxven Generator",
+            description=f"Here is your {acctype} account:\n```\n{account}\n```",
+            color=discord.Color.purple()
+        )
+        embed.set_footer(text="Click to copy • Rxven Gen")
+        await interaction.user.send(embed=embed)
+        await log_action(f"User {user_id} generated {acctype} account: {account}")
+
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            description=f"✅ Generated {num_accounts} account(s). Check your DMs!",
+            color=discord.Color.purple()
+        ),
+        ephemeral=True
+    )
+
+    if user_id not in cooldowns:
+        cooldowns[user_id] = {}
+    cooldowns[user_id][acctype] = datetime.now().timestamp() + cooldown_time
+    asyncio.create_task(remove_cooldown(user_id, acctype, cooldown_time))
+
+@bot.tree.command(name="adminpanel", description="Admin panel for managing account types and keys", guild=discord.Object(id=GUILD_ID))
+async def adminpanel(interaction: discord.Interaction):
+    if ADMIN_ROLE_ID not in [role.id for role in interaction.user.roles]:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="❌ You do not have permission to use this command.",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        await log_action(f"User {interaction.user.id} attempted to access admin panel without permission")
+        return
+
+    embed = discord.Embed(
+        title="🛠️ Rxven Admin Panel",
+        description="What would you like to do?",
+        color=discord.Color.purple()
+    )
+    view = AdminPanelView()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await log_action(f"Admin {interaction.user.id} accessed admin panel")
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(AdminPanelButton(label="📦 Create Stock", style=discord.ButtonStyle.primary, custom_id="create_stock"))
+        self.add_item(AdminPanelButton(label="🗑️ Remove Stock", style=discord.ButtonStyle.danger, custom_id="remove_stock"))
+        self.add_item(AdminPanelButton(label="🧹 Clear Stock", style=discord.ButtonStyle.secondary, custom_id="clear_stock"))
+        self.add_item(AdminPanelButton(label="🔑 Generate Key", style=discord.ButtonStyle.success, custom_id="generate_key"))
+        self.add_item(AdminPanelButton(label="⛔ Blacklist User", style=discord.ButtonStyle.danger, custom_id="blacklist_user"))
+        self.add_item(AdminPanelButton(label="✅ Unblacklist User", style=discord.ButtonStyle.secondary, custom_id="unblacklist_user"))
+        self.add_item(AdminPanelButton(label="❌ Remove Premium", style=discord.ButtonStyle.secondary, custom_id="remove_user_premium"))
+        self.add_item(AdminPanelButton(label="⭐ Give Premium", style=discord.ButtonStyle.success, custom_id="give_user_premium"))
+
+class AdminPanelButton(discord.ui.Button):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.custom_id == "create_stock":
+            await interaction.response.send_modal(CreateStockModal())
+        elif self.custom_id == "remove_stock":
+            await interaction.response.send_modal(RemoveStockModal())
+        elif self.custom_id == "clear_stock":
+            await interaction.response.send_modal(ClearStockModal())
+        elif self.custom_id == "generate_key":
+            await interaction.response.send_modal(GenerateKeyModal())
+        elif self.custom_id == "blacklist_user":
+            await interaction.response.send_modal(BlacklistUserModal())
+        elif self.custom_id == "unblacklist_user":
+            await interaction.response.send_modal(UnblacklistUserModal())
+        elif self.custom_id == "remove_user_premium":
+            await interaction.response.send_modal(RemoveUserPremiumModal())
+        elif self.custom_id == "give_user_premium":
+            await interaction.response.send_modal(GiveUserPremiumModal())
+
+class CreateStockModal(discord.ui.Modal, title="📦 Create Stock"):
+    name = discord.ui.TextInput(label="Account Type Name")
+    accounts = discord.ui.TextInput(label="Accounts (comma or newline separated)", style=discord.TextStyle.paragraph)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name.value
+        accounts = [acc.strip() for acc in self.accounts.value.replace(',', '\n').split('\n') if acc.strip()]
+
+        if name in account_types:
+            account_types[name].extend(accounts)
+            message = f"📦 Added {len(accounts)} accounts to {name}."
+        else:
+            account_types[name] = accounts
+            message = f"📦 Created new account type {name}."
+
+        save_data()
+        await interaction.response.send_message(
+            embed=discord.Embed(description=message, color=discord.Color.purple()),
+            ephemeral=True
+        )
+        await log_action(f"Admin {interaction.user.id} added {len(accounts)} accounts to {name}")
+        await notify_restock(name, len(accounts))
+
+class RemoveStockModal(discord.ui.Modal, title="🗑️ Remove Stock"):
+    name = discord.ui.TextInput(label="Account Type Name")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name.value
+        if name in account_types:
+            del account_types[name]
+            save_data()
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"🗑️ Account type {name} removed.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            await log_action(f"Admin {interaction.user.id} removed account type {name}")
+        else:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Account type not found.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+
+class ClearStockModal(discord.ui.Modal, title="🧹 Clear Stock"):
+    name = discord.ui.TextInput(label="Account Type Name")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name.value
+        if name in account_types:
+            old_count = len(account_types[name])
+            account_types[name] = []
+            save_data()
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"🧹 Cleared {old_count} accounts from {name}.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            await log_action(f"Admin {interaction.user.id} cleared {old_count} accounts from {name}")
+        else:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Account type not found.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+
+class GenerateKeyModal(discord.ui.Modal, title="🔑 Generate Premium Key"):
+    duration = discord.ui.TextInput(label="Duration (days, 0 for lifetime)")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            duration = int(self.duration.value)
+        except ValueError:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Invalid duration.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            return
+
+        key = f"RXVEN-{os.urandom(2).hex().upper()}-{os.urandom(2).hex().upper()}"
+        expiry_date = None if duration == 0 else (datetime.now() + timedelta(days=duration)).isoformat()
+        premium_keys[key] = {"expiry_date": expiry_date, "role_id": PREMIUM_ROLE_ID}
+        save_data()
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=f"🔑 Premium key generated: `{key}`\nDuration: {'Lifetime' if duration == 0 else f'{duration} days'}",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        await log_action(f"Admin {interaction.user.id} generated premium key {key} with duration {duration} days")
+
+class BlacklistUserModal(discord.ui.Modal, title="⛔ Blacklist User"):
+    user_id = discord.ui.TextInput(label="User ID")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            member = await interaction.guild.fetch_member(user_id)
+            if not member:
+                raise ValueError
+        except (ValueError, discord.NotFound):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Invalid user ID or user not found.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            return
+
+        if user_id not in blacklisted_users:
+            blacklisted_users.append(user_id)
+            save_data()
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"⛔ User {member.display_name} has been blacklisted.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            await log_action(f"Admin {interaction.user.id} blacklisted user {user_id}")
+        else:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ User is already blacklisted.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+
+class UnblacklistUserModal(discord.ui.Modal, title="✅ Unblacklist User"):
+    user_id = discord.ui.TextInput(label="User ID")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            member = await interaction.guild.fetch_member(user_id)
+            if not member:
+                raise ValueError
+        except (ValueError, discord.NotFound):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Invalid user ID or user not found.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            return
+
+        if user_id in blacklisted_users:
+            blacklisted_users.remove(user_id)
+            save_data()
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"✅ User {member.display_name} has been unblacklisted.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            await log_action(f"Admin {interaction.user.id} unblacklisted user {user_id}")
+        else:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ User is not blacklisted.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+
+class RemoveUserPremiumModal(discord.ui.Modal, title="❌ Remove Premium"):
+    user_id = discord.ui.TextInput(label="User ID")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            member = await interaction.guild.fetch_member(user_id)
+            if not member:
+                raise ValueError
+        except (ValueError, discord.NotFound):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Invalid user ID or user not found.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            return
+
+        role = discord.utils.get(interaction.guild.roles, id=PREMIUM_ROLE_ID)
+        if role in member.roles:
+            await member.remove_roles(role)
+            if user_id in user_premium_expiry:
+                del user_premium_expiry[user_id]
+            save_data()
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"❌ Premium removed from {member.display_name}.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            await log_action(f"Admin {interaction.user.id} removed premium from user {user_id}")
+        else:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ User does not have premium.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+
+class GiveUserPremiumModal(discord.ui.Modal, title="⭐ Give Premium"):
+    user_id = discord.ui.TextInput(label="User ID")
+    duration = discord.ui.TextInput(label="Duration (days, 0 for lifetime)")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            user_id = int(self.user_id.value)
+            member = await interaction.guild.fetch_member(user_id)
+            if not member:
+                raise ValueError
+        except (ValueError, discord.NotFound):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Invalid user ID or user not found.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            return
+
+        try:
+            duration = int(self.duration.value)
+        except ValueError:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ Invalid duration.",
+                    color=discord.Color.purple()
+                ),
+                ephemeral=True
+            )
+            return
+
+        role = discord.utils.get(interaction.guild.roles, id=PREMIUM_ROLE_ID)
+        await member.add_roles(role)
+
+        expiry_date = None if duration == 0 else (datetime.now() + timedelta(days=duration)).isoformat()
+        user_premium_expiry[user_id] = expiry_date
+        save_data()
+
+        await adjust_cooldown_for_premium(user_id)
+
+        if duration == 0:
+            message = f"⭐ Gave {member.display_name} lifetime premium."
+        else:
+            message = f"⭐ Gave {member.display_name} premium for {duration} days."
+
+        await interaction.response.send_message(
+            embed=discord.Embed(description=message, color=discord.Color.purple()),
+            ephemeral=True
+        )
+        await log_action(f"Admin {interaction.user.id} gave premium to user {user_id} for {duration} days")
+
+@bot.tree.command(name="stock", description="Check stock of account types", guild=discord.Object(id=GUILD_ID))
+async def stock(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📦 Rxven Generator Stock",
+        color=discord.Color.purple()
+    )
+    for acctype, accounts in account_types.items():
+        embed.add_field(
+            name=acctype,
+            value=f"📊 {len(accounts)} accounts available",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed)
+    await log_action(f"User {interaction.user.id} checked stock")
+
+@bot.tree.command(name="redeemkey", description="Redeem a premium key", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(key="The premium key to redeem")
+async def redeemkey(interaction: discord.Interaction, key: str):
+    if key not in premium_keys:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="❌ Invalid key.",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        return
+
+    key_data = premium_keys[key]
+    expiry_date = key_data["expiry_date"]
+
+    if expiry_date and datetime.fromisoformat(expiry_date) < datetime.now():
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="❌ Key has expired.",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+        return
+
+    role = discord.utils.get(interaction.guild.roles, id=PREMIUM_ROLE_ID)
+    await interaction.user.add_roles(role)
+    del premium_keys[key]
+
+    user_premium_expiry[interaction.user.id] = expiry_date
+    save_data()
+
+    await adjust_cooldown_for_premium(interaction.user.id)
+
+    if expiry_date:
+        expiry_datetime = datetime.fromisoformat(expiry_date)
+        remaining_time = expiry_datetime - datetime.now()
+        days, seconds = remaining_time.days, remaining_time.seconds
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+
+        time_str = ""
+        if days > 0:
+            time_str += f"{days} days "
+        if hours > 0:
+            time_str += f"{hours} hours "
+        if minutes > 0 or (days == 0 and hours == 0):
+            time_str += f"{minutes} minutes"
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description=f"⭐ Premium activated! Time remaining: {time_str}",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                description="⭐ Lifetime premium activated!",
+                color=discord.Color.purple()
+            ),
+            ephemeral=True
+        )
+    await log_action(f"User {interaction.user.id} redeemed premium key {key}")
+
+@bot.tree.command(name="profile", description="Check your profile", guild=discord.Object(id=GUILD_ID))
+async def profile(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    is_premium = any(role.id == PREMIUM_ROLE_ID for role in interaction.user.roles)
+
+    embed = discord.Embed(
+        title="👤 Rxven Profile",
+        color=discord.Color.purple()
+    )
+
+    if is_premium:
+        expiry_date = user_premium_expiry.get(user_id)
+        if expiry_date:
+            expiry_datetime = datetime.fromisoformat(expiry_date)
+            remaining_time = expiry_datetime - datetime.now()
+            days, seconds = remaining_time.days, remaining_time.seconds
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+
+            time_str = ""
+            if days > 0:
+                time_str += f"{days} days "
+            if hours > 0:
+                time_str += f"{hours} hours "
+            if minutes > 0 or (days == 0 and hours == 0):
+                time_str += f"{minutes} minutes"
+
+            embed.description = f"⭐ Premium User\nTime remaining: {time_str}"
+        else:
+            embed.description = "⭐ Lifetime Premium User"
+    else:
+        embed.description = "📦 Free User\n💫 Consider upgrading to premium!"
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await log_action(f"User {interaction.user.id} checked their profile")
+
+async def remove_cooldown(user_id, acctype, cooldown):
+    await asyncio.sleep(cooldown)
+    if user_id in cooldowns and acctype in cooldowns[user_id]:
+        del cooldowns[user_id][acctype]
+
+async def notify_restock(name, amount):
+    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(
+            title="📦 Rxven Generator Restock",
+            description=f"New stock added!\n{name}: {amount} accounts",
+            color=discord.Color.purple()
+        )
+        await channel.send(embed=embed)
+        await log_action(f"Restock notification sent for {amount} {name} accounts")
+
+bot.run(TOKEN)
